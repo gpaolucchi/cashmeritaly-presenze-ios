@@ -1,0 +1,112 @@
+workflows:
+  ios-testflight:
+    name: iOS TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    integrations:
+      app_store_connect: CashmeritalyASC
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: '*'
+          include: true
+      cancel_previous_builds: true
+    environment:
+      ios_signing:
+        provisioning_profiles:
+          - Cashmeritaly App Store
+        certificates:
+          - Cashmeritaly Dist
+      vars:
+        XCODE_SCHEME: "CashmeritalyPresenze"
+        # Apple ID numerico app (App Store Connect → App Information)
+        APP_STORE_APPLE_ID: "6811048772"
+      xcode: latest
+    scripts:
+      - name: Initialize keychain
+        script: keychain initialize
+
+      - name: Add certificates to keychain
+        script: keychain add-certificates
+
+      - name: Apply provisioning profiles
+        script: xcode-project use-profiles
+
+      - name: Set unique build number
+        script: |
+          set -e
+          cd ios/CashmeritalyPresenze
+
+          # 1) Ultimo build su App Store Connect (se leggibile)
+          set +e
+          ASC_RAW=$(app-store-connect get-latest-build-number "$APP_STORE_APPLE_ID" 2>/dev/null)
+          set -e
+          ASC_BUILD_NO=$(echo "$ASC_RAW" | tr -cd '0-9')
+          if [ -z "$ASC_BUILD_NO" ]; then
+            ASC_BUILD_NO=0
+          fi
+
+          # 2) Timestamp al secondo
+          TIME_BASED_NO=$(date +%y%m%d%H%M%S)
+
+          # 3) Prendi il massimo, poi aggiungi suffisso build Codemagic
+          #    così anche 2 job nello stesso secondo non collidono
+          if [ "$TIME_BASED_NO" -gt "$ASC_BUILD_NO" ] 2>/dev/null; then
+            BASE=$TIME_BASED_NO
+          else
+            BASE=$((ASC_BUILD_NO + 1))
+          fi
+          SUFFIX=$(printf '%03d' $(( ${CM_BUILD_NUMBER:-0} % 1000 )))
+          BUILD_NO="${BASE}${SUFFIX}"
+
+          echo "ASC latest : $ASC_BUILD_NO"
+          echo "Timestamp  : $TIME_BASED_NO"
+          echo "CM build   : ${CM_BUILD_NUMBER:-0}"
+          echo "CFBundleVersion = $BUILD_NO"
+          export BUILD_NO
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NO" CashmeritalyPresenze/Info.plist
+          echo -n "Info.plist CFBundleVersion="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" CashmeritalyPresenze/Info.plist
+
+          python3 -c "
+          from pathlib import Path
+          import re, os
+          bn = os.environ['BUILD_NO']
+          p = Path('CashmeritalyPresenze.xcodeproj/project.pbxproj')
+          t = p.read_text()
+          t2, n = re.subn(r'CURRENT_PROJECT_VERSION = [0-9]+;', f'CURRENT_PROJECT_VERSION = {bn};', t)
+          p.write_text(t2)
+          print('pbxproj replacements:', n)
+          "
+          grep "CURRENT_PROJECT_VERSION" CashmeritalyPresenze.xcodeproj/project.pbxproj
+
+      - name: Build IPA
+        script: |
+          set -e
+          set -o pipefail
+          cd ios/CashmeritalyPresenze
+          xcodebuild -list -project CashmeritalyPresenze.xcodeproj
+          xcode-project build-ipa \
+            --project CashmeritalyPresenze.xcodeproj \
+            --scheme "$XCODE_SCHEME" \
+            2>&1 | tee "$CM_BUILD_DIR/xcode_build.log"
+          find . -name "*.ipa" -exec ls -lh {} \;
+
+      - name: Upload to App Store Connect
+        script: |
+          set -e
+          IPA=$(find /Users/builder/clone -name "*.ipa" 2>/dev/null | head -1)
+          ls -lh "$IPA"
+          mkdir -p /tmp/ipa_v && rm -rf /tmp/ipa_v/*
+          unzip -q "$IPA" -d /tmp/ipa_v
+          find /tmp/ipa_v -name Info.plist | head -5 | while read pl; do
+            echo "=== $pl ==="
+            /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$pl" 2>/dev/null || true
+          done
+          app-store-connect publish --path "$IPA"
+    artifacts:
+      - /**/*.ipa
+      - xcode_build.log
+    # Upload solo nello script sopra (niente publishing automatico doppio)
