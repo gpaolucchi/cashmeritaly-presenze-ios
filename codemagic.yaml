@@ -1,0 +1,119 @@
+workflows:
+  ios-testflight:
+    name: iOS TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    integrations:
+      app_store_connect: CashmeritalyASC
+    triggering:
+      events:
+        - push
+      branch_patterns:
+        - pattern: '*'
+          include: true
+      cancel_previous_builds: true
+    environment:
+      ios_signing:
+        provisioning_profiles:
+          - Cashmeritaly App Store
+        certificates:
+          - Cashmeritaly Dist
+      vars:
+        XCODE_SCHEME: "CashmeritalyPresenze"
+        APP_STORE_APPLE_ID: "6811048772"
+      xcode: latest
+    scripts:
+      - name: Initialize keychain
+        script: keychain initialize
+
+      - name: Add certificates to keychain
+        script: keychain add-certificates
+
+      - name: Apply provisioning profiles
+        script: xcode-project use-profiles
+
+      - name: Set unique build number
+        script: |
+          set -e
+          cd ios/CashmeritalyPresenze
+
+          # Apple: CFBundleVersion max ~18 caratteri (solo cifre/punti).
+          # NON concatenare timestamp+suffix infinite volte.
+
+          set +e
+          ASC_RAW=$(app-store-connect get-latest-build-number "$APP_STORE_APPLE_ID" 2>/dev/null)
+          set -e
+          ASC=$(echo "$ASC_RAW" | tr -cd '0-9')
+          if [ -z "$ASC" ]; then ASC=0; fi
+
+          # Timestamp corto (12 cifre: aa mm gg HH MM SS)
+          TIME=$(date +%y%m%d%H%M%S)
+
+          # Base = max(ASC, TIME), poi +1 (e eventuale CM_BUILD_NUMBER piccolo)
+          if [ "$ASC" -ge "$TIME" ] 2>/dev/null; then
+            BASE=$ASC
+          else
+            BASE=$TIME
+          fi
+          INC=$(( ${CM_BUILD_NUMBER:-1} % 100 ))
+          if [ "$INC" -lt 1 ]; then INC=1; fi
+          BUILD_NO=$((BASE + INC))
+
+          # Sicurezza: se per errore supera 18 cifre, tronca tenendo le cifre basse + offset
+          LEN=${#BUILD_NO}
+          if [ "$LEN" -gt 18 ]; then
+            BUILD_NO=$(echo "$BUILD_NO" | tail -c 19)
+            # tail -c include newline issues — usa substring
+            BUILD_NO=${BUILD_NO: -18}
+          fi
+
+          echo "ASC latest : $ASC"
+          echo "Timestamp  : $TIME"
+          echo "CM build   : ${CM_BUILD_NUMBER:-0}"
+          echo "CFBundleVersion = $BUILD_NO (len=${#BUILD_NO})"
+          export BUILD_NO
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NO" CashmeritalyPresenze/Info.plist
+          echo -n "Info.plist = "
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" CashmeritalyPresenze/Info.plist
+
+          python3 -c "
+          from pathlib import Path
+          import re, os
+          bn = os.environ['BUILD_NO']
+          assert bn.isdigit() and len(bn) <= 18, bn
+          p = Path('CashmeritalyPresenze.xcodeproj/project.pbxproj')
+          t = p.read_text()
+          t2, n = re.subn(r'CURRENT_PROJECT_VERSION = [0-9]+;', f'CURRENT_PROJECT_VERSION = {bn};', t)
+          p.write_text(t2)
+          print('pbxproj replacements:', n)
+          "
+          grep "CURRENT_PROJECT_VERSION" CashmeritalyPresenze.xcodeproj/project.pbxproj
+
+      - name: Build IPA
+        script: |
+          set -e
+          set -o pipefail
+          cd ios/CashmeritalyPresenze
+          xcodebuild -list -project CashmeritalyPresenze.xcodeproj
+          xcode-project build-ipa \
+            --project CashmeritalyPresenze.xcodeproj \
+            --scheme "$XCODE_SCHEME" \
+            2>&1 | tee "$CM_BUILD_DIR/xcode_build.log"
+          find . -name "*.ipa" -exec ls -lh {} \;
+
+      - name: Upload to App Store Connect
+        script: |
+          set -e
+          IPA=$(find /Users/builder/clone -name "*.ipa" 2>/dev/null | head -1)
+          ls -lh "$IPA"
+          mkdir -p /tmp/ipa_v && rm -rf /tmp/ipa_v/*
+          unzip -q "$IPA" -d /tmp/ipa_v
+          find /tmp/ipa_v -name Info.plist | head -5 | while read pl; do
+            echo "=== $pl ==="
+            /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$pl" 2>/dev/null || true
+          done
+          app-store-connect publish --path "$IPA"
+    artifacts:
+      - /**/*.ipa
+      - xcode_build.log
